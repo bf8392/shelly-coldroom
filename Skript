@@ -1,0 +1,468 @@
+// ===== Kühlraum-Logik für Shelly 2PM + Add-on + bis zu 4x DS18B20 =====
+// RAM-sparsam, KEINE Regex, UTF-8, KVS-Persistenz.
+// Mit Sensornamen (sequenziell), robustem Zeit-Cache (RPC), konfigurierbarer Nachtauzeit NACH dem Heizen,
+// Defrost-Intervall in Minuten, Kompressor-Schutzzeit (Anti-Kurzzyklus), Restlauf & Debug.
+
+// ------- Konfiguration (nur hier anpassen) --------------------
+let cfg = {
+  sensors: [100,101,102,103], // deine Temperatur-IDs
+  cool_on: 3.5,               // °C: ab hier Kühlen EIN  (Relais1)
+  cool_off: 2.5,              // °C: ab hier Kühlen AUS  (Relais1)
+  defrost_every_min: 180,     // MINUTEN bis zum nächsten Abtauzyklus
+  defrost_minutes: 20,        // Abtau-Dauer (Minuten) -> Heizphase
+  nachtau_sec: 300,             // NUR NACH dem Heizen: Nachtauzeit (Sekunden)
+  comp_guard_sec: 300,        // Schutzzeit Kompressor (Sekunden) gegen häufiges Ein/Aus
+  poll_ms: 5000,              // Mess/Regel-Intervall
+  r_cool: 0,                  // Switch-ID: Relais1 (Kühlen/Kompressor)
+  r_def: 1                    // Switch-ID: Relais2 (Abtauheizung/Heißgas)
+};
+
+// ------- interner Zustand -------------------------------------
+let st = {
+  in_defrost: false,
+  step: "idle",
+  last_defrost_ts: 0,   // Unixzeit (Sekunden); wird aus KVS geladen
+  avg: null,
+  valid_cnt: 0,
+  all_na: false,
+  sensor_vals: [],      // Array von [id, tC|null]
+  sensor_names: {},     // id -> Anzeigename
+  def_phase: "",        // "", "pre", "heat", "post"
+  def_heater_end_ts: 0, // Ende der Heizphase (Unixsek)
+
+  // Systemzeit-Cache (per RPC)
+  sys_unixtime: 0,      // Sekunden
+  sys_time_str: "",     // "HH:MM"
+  sys_uptime: 0,        // Sekunden
+  sys_utc_offset: 0,    // Sekunden
+
+  // Anti-Kurzzyklus
+  last_cool_switch_ts: 0, // Unixsek/Uptime der letzten Umschaltung Relais1
+
+  // Lade-Flag
+  loading_names: false
+};
+
+// ------- Systemzeit via RPC cachen (stabil) -------------------
+function refreshSys() {
+  Shelly.call("Shelly.GetStatus", {}, function(resp){
+    let sys = (resp && resp.sys) ? resp.sys : (resp || {});
+    st.sys_unixtime   = (typeof sys.unixtime === "number") ? sys.unixtime : 0;
+    st.sys_time_str   = sys.time ? (""+sys.time) : "";
+    st.sys_uptime     = (typeof sys.uptime === "number") ? sys.uptime : 0;
+    st.sys_utc_offset = (typeof sys.utc_offset === "number") ? sys.utc_offset
+                        : (typeof sys.tz_utc_offset === "number") ? sys.tz_utc_offset : 0;
+  }, function(){
+    Shelly.call("Sys.GetStatus", {}, function(sys){
+      sys = sys || {};
+      st.sys_unixtime   = (typeof sys.unixtime === "number") ? sys.unixtime : 0;
+      st.sys_time_str   = sys.time ? (""+sys.time) : "";
+      st.sys_uptime     = (typeof sys.uptime === "number") ? sys.uptime : 0;
+      st.sys_utc_offset = (typeof sys.utc_offset === "number") ? sys.utc_offset
+                          : (typeof sys.tz_utc_offset === "number") ? sys.tz_utc_offset : 0;
+    }, function(){ /* keep old values */ });
+  });
+}
+refreshSys();
+Timer.set(10000, true, refreshSys); // alle 10 s aktualisieren
+
+// ------- KVS-Helfer (kompatibel KVS/KV) -----------------------
+function kvGet(key, cb) {
+  Shelly.call("KVS.Get", { key: key }, function(r){
+    cb(r && r.value !== undefined ? r.value : null);
+  }, function(){
+    Shelly.call("KV.Get", { key: key }, function(r2){
+      cb(r2 && r2.value !== undefined ? r2.value : null);
+    }, function(){ cb(null); });
+  });
+}
+function kvSet(key, val) {
+  // Write nur 1× pro Abtauende -> Flash-schonend
+  Shelly.call("KVS.Set", { key: key, value: val }, function(){}, function(){
+    Shelly.call("KV.Set", { key: key, value: val }, function(){}, function(){});
+  });
+}
+
+// ------- Relais setzen/lesen ----------------------------------
+function setRelay(id, on) {
+  Shelly.call("Switch.Set", { id: id, on: !!on }, function(){}, function(){});
+}
+function getRelay(id, cb) {
+  if (typeof cb !== "function") return;
+  Shelly.call("Switch.GetStatus", { id: id }, function(rs){
+    cb(!!(rs && rs.output));
+  }, function(){ cb(false); });
+}
+
+// ------- Zeit-Helper ------------------------------------------
+function nowSecs() {
+  // bevorzugt echte Uhr, sonst uptime; 0 => unbekannt
+  return (st.sys_unixtime > 0) ? st.sys_unixtime : ((st.sys_uptime > 0) ? st.sys_uptime : 0);
+}
+function guardReady() {
+  if (!cfg.comp_guard_sec || cfg.comp_guard_sec <= 0) return true;
+  let n = nowSecs();
+  if (n <= 0) return true; // ohne Uhr Guard nicht blockieren
+  if (!st.last_cool_switch_ts || st.last_cool_switch_ts <= 0) return true;
+  return (n - st.last_cool_switch_ts) >= cfg.comp_guard_sec;
+}
+function markCoolSwitched() {
+  let n = nowSecs();
+  if (n > 0) st.last_cool_switch_ts = n;
+}
+
+// ------- Sensornamen laden – sequenziell (ohne Timer-Kaskade) --
+function loadSensorNames() {
+  if (st.loading_names) return;
+  st.loading_names = true;
+  let idx = 0;
+  function step() {
+    if (idx >= cfg.sensors.length) { st.loading_names = false; return; }
+    let sid = cfg.sensors[idx++];
+    if (st.sensor_names[sid]) { step(); return; }
+    Shelly.call("Temperature.GetConfig", { id: sid }, function(resp){
+      st.sensor_names[sid] = (resp && resp.name) ? (""+resp.name) : ("Sensor " + sid);
+      step();
+    }, function(){
+      st.sensor_names[sid] = "Sensor " + sid;
+      step();
+    });
+  }
+  step();
+}
+// beim Start einmal + alle 60 min auffrischen
+loadSensorNames();
+Timer.set(60*60*1000, true, loadSensorNames);
+
+// ------- Temperaturen lesen & Durchschnitt --------------------
+function readAvg() {
+  let sum = 0, n = 0, arr = [];
+  for (let k = 0; k < cfg.sensors.length; k++) {
+    let sid = cfg.sensors[k];
+    let s = Shelly.getComponentStatus("temperature", sid);
+    let v = (s && typeof s.tC === "number" && isFinite(s.tC)) ? s.tC : null;
+    if (v !== null) { sum += v; n++; }
+    arr.push([sid, v]);
+  }
+  st.sensor_vals = arr;
+  st.valid_cnt = n;
+  st.all_na = (n === 0);
+  st.avg = n ? (sum / n) : null;
+}
+
+// ------- Thermostat-Logik (mit Schutzzeit) --------------------
+function applyThermostat() {
+  if (st.in_defrost) return; // Abtau steuert Relais selbst
+
+  if (st.all_na) {
+    // Failsafe: Wenn alle Sensoren N/A -> Kühlung weiterlaufen lassen
+    setRelay(cfg.r_cool, true);
+    setRelay(cfg.r_def, false);
+    st.step = "failsafe_all_sensors_NA";
+    return;
+  }
+
+  getRelay(cfg.r_cool, function(isOn) {
+    let T = st.avg;
+    if (!isFinite(T)) return;
+
+    if (!isOn && T >= cfg.cool_on) {
+      if (guardReady()) {
+        setRelay(cfg.r_cool, true);  markCoolSwitched();
+        st.step = "cooling_on";
+      } else {
+        st.step = "cooling_guard_on_wait";
+      }
+    } else if (isOn && T <= cfg.cool_off) {
+      if (guardReady()) {
+        setRelay(cfg.r_cool, false); markCoolSwitched();
+        st.step = "cooling_off";
+      } else {
+        st.step = "cooling_guard_off_wait";
+      }
+    } else {
+      st.step = isOn ? "cooling_hold_on" : "cooling_hold_off";
+    }
+    // Relais2 im Normalbetrieb aus
+    setRelay(cfg.r_def, false);
+  });
+}
+
+// ------- Abtauzyklus (Pre fix 5 s, Post = konfigurierbar) -----
+let defTimers = { t1: null, t2: null, t3: null };
+function clearDefTimers() {
+  if (defTimers.t1) Timer.clear(defTimers.t1);
+  if (defTimers.t2) Timer.clear(defTimers.t2);
+  if (defTimers.t3) Timer.clear(defTimers.t3);
+  defTimers.t1 = defTimers.t2 = defTimers.t3 = null;
+}
+function endDefrostFinalize() {
+  st.step = "defrost_end";
+  st.in_defrost = false;
+  st.def_phase = "";
+  clearDefTimers();
+
+  // Zeitpunkt fixieren und EINMAL in KVS schreiben (aus Cache)
+  let nowU2 = st.sys_unixtime || 0; // Sekunden
+  st.last_defrost_ts = nowU2;
+  kvSet("coolroom_last_defrost_ts", nowU2);
+
+  // Thermostat wieder übernehmen
+  applyThermostat();
+}
+function startDefrost() {
+  if (st.in_defrost) return;
+  st.in_defrost = true;
+  st.step = "defrost_begin";
+  st.def_phase = "pre";
+  st.def_heater_end_ts = 0;
+
+  // 1) Kühlen aus (falls an) + Schaltzeit markieren
+  getRelay(cfg.r_cool, function(isOn){
+    if (isOn) { setRelay(cfg.r_cool, false); markCoolSwitched(); }
+    else { setRelay(cfg.r_cool, false); }
+  });
+
+  // 2) PRE: fix 5 s warten (Vorbereitung)
+  defTimers.t1 = Timer.set(5000, false, function() {
+    st.step = "defrost_heater_on";
+    st.def_phase = "heat";
+
+    // Heizphase: Ende-Zeitstempel setzen (aus Cache)
+    let nowU = st.sys_unixtime || 0; // Sek
+    st.def_heater_end_ts = nowU + (cfg.defrost_minutes * 60);
+
+    // 3) Abtauheizung an für Y Minuten
+    setRelay(cfg.r_def, true);
+    defTimers.t2 = Timer.set(cfg.defrost_minutes * 60000, false, function() {
+      st.step = "defrost_heater_off";
+      st.def_phase = "post";
+      st.def_heater_end_ts = 0;
+      setRelay(cfg.r_def, false);
+
+      // 4) POST: konfigurierbare Nachtauzeit
+      let waitMs = (cfg.nachtau_sec > 0 ? cfg.nachtau_sec : 0) * 1000;
+      if (waitMs > 0) {
+        defTimers.t3 = Timer.set(waitMs, false, endDefrostFinalize);
+      } else {
+        endDefrostFinalize();
+      }
+    });
+  });
+}
+function maybeDefrost() {
+  if (st.in_defrost) return;
+  let nowU = st.sys_unixtime || 0; // Sekunden
+  if (st.last_defrost_ts === 0) { st.last_defrost_ts = nowU; return; }
+  let everySec = cfg.defrost_every_min * 60; // MINUTEN -> Sekunden
+  if ((nowU - st.last_defrost_ts) >= everySec) startDefrost();
+}
+
+// ------- zyklisch: lesen, regeln, ggf. abtauen ----------------
+Timer.set(cfg.poll_ms, true, function() {
+  readAvg();
+  applyThermostat();
+  maybeDefrost();
+});
+
+// ------- KVS laden (letzten Abtauzeitpunkt) -------------------
+kvGet("coolroom_last_defrost_ts", function(v){
+  let num = v ? parseInt(v, 10) : 0;
+  if (isFinite(num) && num > 0) st.last_defrost_ts = num;
+});
+
+// ------- Mini-Website (UTF-8, ohne Regex/Date) ----------------
+function htmlEscape(s){
+  s = "" + s;
+  s = s.split("&").join("&amp;");
+  s = s.split("<").join("&lt;");
+  s = s.split(">").join("&gt;");
+  return s;
+}
+
+// Lokale Uhrzeit aus Cache (HH:MM)
+function localClockString() {
+  if (st.sys_unixtime > 0) {
+    let local = st.sys_unixtime + st.sys_utc_offset;
+    let t = local % 86400; if (t < 0) t += 86400;
+    let hh = (t / 3600) >> 0;
+    let mm = ((t % 3600) / 60) >> 0;
+    if (hh < 10) hh = "0" + hh;
+    if (mm < 10) mm = "0" + mm;
+    return hh + ":" + mm;
+  }
+  if (st.sys_time_str) return st.sys_time_str;
+  return "–";
+}
+// Lokale Uhrzeit aus Unix-Sekunden (HH:MM)
+function localClockFromUnix(ts) {
+  if (!ts || ts <= 0) return "–";
+  let local = ts + st.sys_utc_offset;
+  let t = local % 86400; if (t < 0) t += 86400;
+  let hh = (t / 3600) >> 0;
+  let mm = ((t % 3600) / 60) >> 0;
+  if (hh < 10) hh = "0" + hh;
+  if (mm < 10) mm = "0" + mm;
+  return hh + ":" + mm;
+}
+
+// Restzeitformat hh:mm:ss
+function fmtHMS(sec) {
+  if (typeof sec !== "number" || sec < 0) sec = 0;
+  let h = (sec / 3600) >> 0;
+  let m = ((sec % 3600) / 60) >> 0;
+  let s = (sec % 60) >> 0;
+  if (h < 10) h = "0" + h;
+  if (m < 10) m = "0" + m;
+  if (s < 10) s = "0" + s;
+  return h + ":" + m + ":" + s;
+}
+
+// Restzeit bis nächstem Defrost + Debug, robust (ntp/uptime/fallback)
+function calcNextDefrost() {
+  let everySec = cfg.defrost_every_min * 60;
+  let nowU = st.sys_unixtime || 0;
+  let up   = st.sys_uptime   || 0;
+
+  let out = { txt:"—:—:—", method:"none", remain:0 };
+  if (st.in_defrost) { out.txt = "läuft gerade"; out.method = "running"; return out; }
+
+  if (everySec > 0 && nowU > 0 && st.last_defrost_ts > 0) {
+    let target = st.last_defrost_ts + everySec;
+    if (target < nowU) target = nowU;
+    out.remain = target - nowU;
+    out.txt = fmtHMS(out.remain);
+    out.method = "ntp";
+    return out;
+  }
+  if (everySec > 0 && up > 0) {
+    let remain = everySec - (up % everySec);
+    if (remain === everySec) remain = 0;
+    out.remain = remain;
+    out.txt = fmtHMS(remain);
+    out.method = "uptime";
+    return out;
+  }
+  if (everySec > 0) { out.txt = fmtHMS(everySec); out.method = "fallback"; }
+  return out;
+}
+
+function pageHtml() {
+  let okAvg = (st.avg !== null) ? (st.avg.toFixed(2) + " °C") : "N/A";
+  let phase = st.in_defrost ? "Abtauprogramm" : "Kühlphase";
+
+  // Zeit bis nächstem Defrost + letzter Defrost (Uhrzeit)
+  let nextInfo = calcNextDefrost();
+  let nextDef_txt = nextInfo.txt;
+  let lastDef_clock = localClockFromUnix(st.last_defrost_ts);
+
+  // Defrost-Restlauf (nur Heizphase)
+  let nowU = st.sys_unixtime || 0;
+  let defRest_txt = "–";
+  if (st.in_defrost) {
+    if (st.def_phase === "pre") defRest_txt = "Vorbereitung (≈5 s)";
+    else if (st.def_phase === "heat") {
+      let remain = (st.def_heater_end_ts > 0 && nowU > 0) ? (st.def_heater_end_ts - nowU) : 0;
+      if (remain < 0) remain = 0;
+      defRest_txt = "noch " + fmtHMS(remain) + " von " + fmtHMS(cfg.defrost_minutes*60);
+    } else if (st.def_phase === "post") defRest_txt = "Nachlauf (≈" + cfg.nachtau_sec + " s)";
+  }
+
+  // Rohwerte-Tabelle mit Namen
+  let rows = "";
+  for (let i = 0; i < st.sensor_vals.length; i++) {
+    let id = st.sensor_vals[i][0];
+    let v  = st.sensor_vals[i][1];
+    let nm = st.sensor_names[id] || ("Sensor " + id);
+    let txt = (v === null) ? "N/A" : ("" + v.toFixed(2) + " °C");
+    rows += "<tr><td>"+htmlEscape(nm)+" ("+id+")</td><td>"+txt+"</td></tr>";
+  }
+  if (rows === "") rows = "<tr><td colspan=2>Keine Sensoren konfiguriert</td></tr>";
+
+  // Debug-Block
+  let sinceSwitch = 0;
+  let n = nowSecs();
+  if (n > 0 && st.last_cool_switch_ts > 0) sinceSwitch = n - st.last_cool_switch_ts;
+
+  let dbg = "";
+  dbg += "<h3 style='margin-top:14px'>Debug</h3>";
+  dbg += "<table><tr><th>Feld</th><th>Wert</th></tr>";
+  dbg += "<tr><td>sys.unixtime</td><td>"+(st.sys_unixtime||0)+"</td></tr>";
+  dbg += "<tr><td>sys.time</td><td>"+htmlEscape(st.sys_time_str||"-")+"</td></tr>";
+  dbg += "<tr><td>sys.utc_offset</td><td>"+(st.sys_utc_offset||0)+"</td></tr>";
+  dbg += "<tr><td>sys.uptime</td><td>"+(st.sys_uptime||0)+"</td></tr>";
+  dbg += "<tr><td>last_defrost_ts</td><td>"+(st.last_defrost_ts||0)+"</td></tr>";
+  dbg += "<tr><td>next.method</td><td>"+nextInfo.method+"</td></tr>";
+  dbg += "<tr><td>next.remain (s)</td><td>"+nextInfo.remain+"</td></tr>";
+  dbg += "<tr><td>last_cool_switch_ts</td><td>"+(st.last_cool_switch_ts||0)+" (+"+sinceSwitch+" s)</td></tr>";
+  dbg += "<tr><td>cfg.comp_guard_sec</td><td>"+cfg.comp_guard_sec+" s</td></tr>";
+  dbg += "<tr><td>cfg.defrost_every_min</td><td>"+cfg.defrost_every_min+" min</td></tr>";
+  dbg += "<tr><td>cfg.nachtau_sec</td><td>"+cfg.nachtau_sec+" s</td></tr>";
+  dbg += "</table>";
+
+  // HTML
+  let h = "";
+  h += "<!doctype html><meta charset='UTF-8'><meta name=viewport content='width=device-width,initial-scale=1'>";
+  h += "<title>Kühlraum-Status</title>";
+  h += "<style>body{font-family:system-ui,Arial;margin:12px}table{border-collapse:collapse}td,th{padding:4px 6px;border:1px solid #ddd}a{font:inherit}</style>";
+  h += "<h2>Kühlraum</h2>";
+  h += "<table>";
+  h += "<tr><th>Ø-Temperatur</th><td>"+htmlEscape(okAvg)+"</td></tr>";
+  h += "<tr><th>Gültige Sensoren</th><td>"+st.valid_cnt+(st.all_na?" (alle N/A)":"")+"</td></tr>";
+  h += "<tr><th>Phase</th><td>"+phase+"</td></tr>";
+  h += "<tr><th>Zeit bis zum nächsten Defrost</th><td>"+nextDef_txt+"</td></tr>";
+  h += "<tr><th>Letzter Defrost (Uhrzeit)</th><td>"+localClockFromUnix(st.last_defrost_ts)+"</td></tr>";
+  h += "<tr><th>Defrost-Restlauf (Heizung)</th><td>"+defRest_txt+"</td></tr>";
+  h += "<tr><th>Status</th><td>"+htmlEscape(st.step)+"</td></tr>";
+  h += "<tr><th>cool_on</th><td>"+cfg.cool_on+" °C</td></tr>";
+  h += "<tr><th>cool_off</th><td>"+cfg.cool_off+" °C</td></tr>";
+  h += "<tr><th>Schutzzeit Kompressor</th><td>"+cfg.comp_guard_sec+" s</td></tr>";
+  h += "<tr><th>Zeitintervall Abtauzyklus</th><td>"+cfg.defrost_every_min+" min</td></tr>";
+  h += "<tr><th>Abtau-Dauer</th><td>"+cfg.defrost_minutes+" min</td></tr>";
+  h += "<tr><th>Nachtauzeit</th><td>"+cfg.nachtau_sec+" s</td></tr>";
+  h += "<tr><th>Sensorauswahl</th><td>"+htmlEscape(JSON.stringify(cfg.sensors))+"</td></tr>";
+  h += "</table>";
+
+  h += "<h3>Sensor-Rohwerte</h3>";
+  h += "<table><tr><th>Name (ID)</th><th>Temperatur</th></tr>"+rows+"</table>";
+
+  h += "<p><a href='defrost'>Abtauzyklus jetzt starten</a></p>";
+  h += "<p style='color:#888'>Zeit (lokal): "+localClockString()+"</p>";
+  h += dbg;
+
+  return h;
+}
+
+// ------- HTTP-Endpunkte unter /script/<ID>/… ------------------
+if (typeof HTTPServer !== "undefined" && typeof HTTPServer.registerEndpoint === "function") {
+  HTTPServer.registerEndpoint("coolroom", function (req, res) {
+    res.code = 200;
+    res.headers = { "Content-Type": "text/html; charset=UTF-8" };
+    res.body = pageHtml();
+    res.send();
+  });
+  HTTPServer.registerEndpoint("defrost", function (req, res) {
+    startDefrost();
+    res.code = 200;
+    res.headers = { "Content-Type": "text/html; charset=UTF-8" };
+    res.body = "<meta http-equiv=refresh content='0;url=coolroom'>OK";
+    res.send();
+  });
+} else if (typeof HTTP !== "undefined" && typeof HTTP.setHandler === "function") {
+  HTTP.setHandler(function (req, res) {
+    if (!req || !req.uri) return;
+    if (req.uri.indexOf("/coolroom") >= 0) {
+      res.code = 200; res.headers = {"Content-Type":"text/html; charset=UTF-8"}; res.body = pageHtml(); res.send();
+    } else if (req.uri.indexOf("/defrost") >= 0) {
+      startDefrost();
+      res.code = 200; res.headers = {"Content-Type":"text/html; charset=UTF-8"}; res.body = "<meta http-equiv=refresh content='0;url=coolroom'>OK"; res.send();
+    }
+  });
+} else {
+  print("Kein HTTP-API gefunden – UI-Endpunkte deaktiviert.");
+}
+
+// ------- Initiale Aktionen ------------------------------------
+loadSensorNames();
+refreshSys();
+// ------- Ende --------------------------------------------------
